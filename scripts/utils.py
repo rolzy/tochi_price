@@ -1,5 +1,8 @@
 import numpy as np
 import pandas as pd
+import lightgbm as lgb 
+from sklearn.model_selection import train_test_split 
+from sklearn.metrics import accuracy_score
 
 def mean_absolute_percentage_error(y_true, y_pred): 
     return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
@@ -20,7 +23,7 @@ def basic_preprocessing():
     # 土地のネームバリューが出てくると思うので、名前系はあとで追加するかも
 
     name_columns = ['bastei_nm1','bastei_nm2','chiseki_kb_hb','eki_nm1','eki_nm2','gk_chu_tm','gk_sho_tm', \
-                    'hy1f_date_su', 'hy2f_date_su','jukyo','mseki_yt_hb','tc_mseki','yoseki2','id']
+                    'hy1f_date_su', 'hy2f_date_su','mseki_yt_hb','tc_mseki','yoseki2','id']
     train.drop(name_columns, axis=1, inplace=True)
     test.drop(name_columns, axis=1, inplace=True)
 
@@ -89,3 +92,43 @@ def basic_preprocessing():
     test.drop(unique_columns, axis=1, inplace=True, errors='ignore')
 
     return train, test, y_train, submission
+
+def lightgbm_default(train, y_train):
+
+    # X_trainとY_trainをtrainとvalidに分割
+    train_x, valid_x, train_y, valid_y = train_test_split(train, y_train, test_size=0.33, random_state=0)
+
+    # create dataset for lightgbm
+    lgb_train = lgb.Dataset(train_x, train_y)
+    lgb_eval = lgb.Dataset(valid_x, valid_y, reference=lgb_train)
+
+    # specify your configurations as a dict
+    params = {
+        'boosting_type': 'gbdt',
+        'objective': 'regression',
+        'metric': {'l2', 'l1'},
+        'num_leaves': 31,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.9,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'verbose': 0
+    }
+
+    print('Starting training...')
+    # train
+    gbm = lgb.train(params,
+                    lgb_train,
+                    num_boost_round=5000,
+                    valid_sets=lgb_eval,
+                    early_stopping_rounds=20)
+                            
+    print('Saving model...')
+    # save model to file
+    gbm.save_model('model.txt')
+
+    print('Starting predicting...')
+    # predict
+    y_pred = gbm.predict(valid_x, num_iteration=gbm.best_iteration)
+    # eval
+    print('The MAPE of prediction is:', mean_absolute_percentage_error(valid_y, y_pred))
