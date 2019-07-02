@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import lightgbm as lgb 
-from sklearn.model_selection import train_test_split 
+from sklearn.model_selection import KFold, train_test_split 
 from sklearn.metrics import accuracy_score
 
 def mean_absolute_percentage_error(y_true, y_pred): 
@@ -24,6 +24,7 @@ def basic_preprocessing():
 
     name_columns = ['bastei_nm1','bastei_nm2','chiseki_kb_hb','eki_nm1','eki_nm2','gk_chu_tm','gk_sho_tm', \
                     'hy1f_date_su', 'hy2f_date_su','mseki_yt_hb','tc_mseki','yoseki2','id']
+
     train.drop(name_columns, axis=1, inplace=True)
     test.drop(name_columns, axis=1, inplace=True)
 
@@ -54,11 +55,11 @@ def basic_preprocessing():
     train = pd.concat([train, train[hokakisei].stack().str.get_dummies().sum(level=0), \
                             train[kobetsu].stack().str.get_dummies().sum(level=0)], axis=1)
     train.drop(hokakisei+kobetsu, axis=1, inplace=True)
-    train.iloc[:,137:] = train.iloc[:,137:].fillna(0.0).apply(lambda x: [0 if y == 0.0 else 1 for y in x])
+    train.iloc[:,136:] = train.iloc[:,136:].fillna(0.0).apply(lambda x: [0 if y == 0.0 else 1 for y in x])
     test = pd.concat([test, test[hokakisei].stack().str.get_dummies().sum(level=0), \
                             test[kobetsu].stack().str.get_dummies().sum(level=0)], axis=1)
     test.drop(hokakisei+kobetsu, axis=1, inplace=True)
-    test.iloc[:,136:] = test.iloc[:,136:].fillna(0.0).apply(lambda x: [0 if y == 0.0 else 1 for y in x])
+    test.iloc[:,135:] = test.iloc[:,135:].fillna(0.0).apply(lambda x: [0 if y == 0.0 else 1 for y in x])
 
     # BooleanであるハズがCategoricalになってるカラムに対処
 
@@ -69,6 +70,39 @@ def basic_preprocessing():
                                         '公共下水':0,'個別浄化槽':1,'公営':0,'私営':1,'実測':0,'公簿':1})
     test[bool_columns] = test[bool_columns].replace({'（不要）':0, '（無）':0,'（要）':1,'（有）':1,
                                         '公共下水':0,'個別浄化槽':1,'公営':0,'私営':1,'実測':0,'公簿':1})
+
+    # ちょっとデータを追加
+    # Levelplanから階数と部屋を分割
+    # 公表された平均価格の平均を追加
+
+    levelplan_split_train = train['levelplan'].str.split('/', n=1, expand=True)
+    train['level'] = levelplan_split_train[0]
+    train['rooms'] = levelplan_split_train[1]
+
+    levelplan_split_test = test['levelplan'].str.split('/', n=1, expand=True)
+    test['level'] = levelplan_split_test[0]
+    test['rooms'] = levelplan_split_test[1]
+
+    # 全部埼玉県なので住居から消去
+    # あと市が抜けてる住所情報は追加してあげる
+
+    shi_gun_dic = dict({'にっさい花みず木':'坂戸市にっさい花みず木','西鶴ヶ岡':'ふじみ野市西鶴ヶ岡', \
+                        '杉戸町内田':'北葛飾郡杉戸町内田','宮代町宮代台':'南埼玉郡宮代町宮代台', \
+                        '大字下日出谷':'桶川市大字下日出谷','杉戸町清地':'北葛飾郡杉戸町', \
+                        '松伏町田中':'北葛飾郡松伏町','大字水野字逃水':'狭山市大字水野字逃水'})
+
+    train['jukyo'] = train['jukyo'].str.replace('埼玉県','')
+    test['jukyo'] = test['jukyo'].str.replace('埼玉県','')
+    train['jukyo'] = train['jukyo'].replace(shi_gun_dic)
+    test['jukyo'] = test['jukyo'].replace(shi_gun_dic)
+
+    jukyo_split_train = train['jukyo'].str.split(r'市|郡', n=1, expand=True)
+    train['jukyo_shi_gun'] = jukyo_split_train[0]
+    train.drop('jukyo', axis=1, inplace=True)
+
+    jukyo_split_test = test['jukyo'].str.split(r'市|郡', n=1, expand=True)
+    test['jukyo_shi_gun'] = jukyo_split_test[0]
+    test.drop('jukyo', axis=1, inplace=True)
 
     # 最後に、categoricalなカラムを全てone_hot_encode
     categorical = ['bas_toho1','bas_toho2','bokachiiki','gas','hiatari','hw_status','jigata','kodochiku', \
@@ -93,14 +127,13 @@ def basic_preprocessing():
 
     return train, test, y_train, submission
 
-def lightgbm_default(train, y_train):
+def lightgbm_5fold(train, y_train):
+    # 3分割交差検証を指定し、インスタンス化 
+    kf = KFold(n_splits=5) 
 
-    # X_trainとY_trainをtrainとvalidに分割
-    train_x, valid_x, train_y, valid_y = train_test_split(train, y_train, test_size=0.33, random_state=0)
-
-    # create dataset for lightgbm
-    lgb_train = lgb.Dataset(train_x, train_y)
-    lgb_eval = lgb.Dataset(valid_x, valid_y, reference=lgb_train)
+    # スコアとモデルを格納するリスト 
+    score_list = [] 
+    models = [] 
 
     # specify your configurations as a dict
     params = {
@@ -115,20 +148,35 @@ def lightgbm_default(train, y_train):
         'verbose': 0
     }
 
-    print('Starting training...')
-    # train
-    gbm = lgb.train(params,
-                    lgb_train,
-                    num_boost_round=5000,
-                    valid_sets=lgb_eval,
-                    early_stopping_rounds=20)
-                            
-    print('Saving model...')
-    # save model to file
-    gbm.save_model('model.txt')
+    for fold_, (train_index, valid_index) in enumerate(kf.split(train, y_train)):
+        train_x = train.iloc[train_index]
+        valid_x = train.iloc[valid_index]
+        train_y = y_train[train_index]
+        valid_y = y_train[valid_index]
 
-    print('Starting predicting...')
-    # predict
-    y_pred = gbm.predict(valid_x, num_iteration=gbm.best_iteration)
-    # eval
-    print('The MAPE of prediction is:', mean_absolute_percentage_error(valid_y, y_pred))
+        # create dataset for lightgbm
+        lgb_train = lgb.Dataset(train_x, train_y)
+        lgb_eval = lgb.Dataset(valid_x, valid_y, reference=lgb_train)
+        print(f'fold{fold_ + 1} start')
+        gbm = lgb.train(params,
+                        lgb_train,
+                        num_boost_round=5000,
+                        valid_sets=lgb_eval,
+                        early_stopping_rounds=20,
+                        verbose_eval=0)
+        y_pred = gbm.predict(valid_x, num_iteration=gbm.best_iteration)
+        score_list.append(mean_absolute_percentage_error(valid_y, y_pred))
+        models.append(gbm)  # 学習が終わったモデルをリストに入れておく
+        print(f'fold{fold_ + 1} end\nAccuracy = {mean_absolute_percentage_error(valid_y, y_pred)}')
+    print(score_list, '平均score', np.mean(score_list))
+
+    return models
+
+def predict_5fold(test, models, submission):
+    test_pred = np.zeros((len(test), 5)) 
+    for fold_, gbm in enumerate(models):
+        pred_ = gbm.predict(test, num_iteration=gbm.best_iteration)# testを予測
+        test_pred[:, fold_] = pred_ 
+    pred = np.mean(test_pred, axis=1)
+    submission['price'] = pred
+    submission.to_csv('lightgbm.tsv', sep='\t', index=False, header=False)
